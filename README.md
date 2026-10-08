@@ -78,7 +78,7 @@ flowchart TD
    - Automatic cross-metro spillover to the surviving zone if a pod or node experiences consecutive 5xx errors or outages.
 6. **Dedicated Storage Node Isolation**:
    - Storage nodes `okd4-storage-1..3` are dedicated strictly to Ceph/CSI storage and are excluded from HAProxy ingress load balancing.
-6. **Interactive Management & Full Observability**:
+7. **Interactive Management & Full Observability**:
    - Dedicated **HAProxy Metro Web Controller** for 1-click zone failover simulations.
    - **Kiali Console** and **Grafana Dashboards** integrated with OpenShift User Workload Monitoring.
 
@@ -97,23 +97,173 @@ flowchart TD
 
 ---
 
-## 3. Node & Topology Mapping
+## 3. Cluster Topology & Node Architecture
 
-| Node | Proxmox Zone | Subzone (`topology.istio.io/subzone`) | Ingress Ports | Pod CIDR Range | Metro Role |
+### Node Topology Mapping
+
+| Node | Proxmox Zone | Subzone (`topology.istio.io/subzone`) | Ingress Ports | Pod CIDR Range | Metro Role & Description |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`master0`** | `pv1` | - | `:6443`, `:22623` | `10.128.0.0/23` | Control Plane (etcd + API) |
-| **`master1`** | `pv1` | - | `:6443`, `:22623` | `10.129.0.0/23` | Control Plane (etcd + API) |
-| **`master2`** | `pv1` | - | `:6443`, `:22623` | `10.130.0.0/23` | Control Plane (etcd + API) |
-| **`worker0`** | `pv1` | **`site-a`** | `:80`, `:443`, `:30080` | `10.128.2.0/23` | **Site A Primary Worker** |
-| **`worker1`** | `pv1` | **`site-a`** | `:80`, `:443`, `:30080` | `10.129.2.0/23` | **Site A Primary Worker** |
-| **`worker2`** | `pv1` | **`site-b`** | `:80`, `:443`, `:30080` | `10.130.2.0/23` | **Site B Standby / Survivor** |
-| **`worker3`** | `pv1` | **`site-b`** | `:80`, `:443`, `:30080` | `10.131.0.0/23` | **Site B Standby / Survivor** |
+| **`master0`** | `pv1` | - | `:6443`, `:22623` | `10.128.0.0/23` | Control Plane (etcd member 1, API server) |
+| **`master1`** | `pv1` | - | `:6443`, `:22623` | `10.129.0.0/23` | Control Plane (etcd member 2, API server) |
+| **`master2`** | `pv1` | - | `:6443`, `:22623` | `10.130.0.0/23` | Control Plane (etcd member 3, API server) |
+| **`worker0`** | `pv1` | **`site-a`** | `:80`, `:443`, `:30080` | `10.128.2.0/23` | **Site A Primary Worker** (Router + IngressGateway + Workloads) |
+| **`worker1`** | `pv1` | **`site-a`** | `:80`, `:443`, `:30080` | `10.129.2.0/23` | **Site A Primary Worker** (Router + IngressGateway + Workloads) |
+| **`worker2`** | `pv1` | **`site-b`** | `:80`, `:443`, `:30080` | `10.130.2.0/23` | **Site B Standby / Survivor** (Router + IngressGateway + Workloads) |
+| **`worker3`** | `pv1` | **`site-b`** | `:80`, `:443`, `:30080` | `10.131.0.0/23` | **Site B Standby / Survivor** (Router + IngressGateway + Workloads) |
 
-*(Note: Storage nodes `okd4-storage-1..3` are dedicated to Ceph/CSI storage and are excluded from HTTP/HTTPS ingress balancing).*
+> [!NOTE]
+> **Proxmox CSI Storage Compatibility**: All nodes intentionally share `topology.kubernetes.io/zone=pv1` to maintain a single unified storage pool for the Proxmox CSI driver (Ceph/RBD). Physical metro datacenter separation is defined cleanly using the standard Istio topology label `topology.istio.io/subzone` (`site-a` vs. `site-b`). Storage nodes `okd4-storage-1..3` are dedicated exclusively to storage operations and are excluded from HAProxy ingress traffic balancing.
 
 ---
 
-## 4. Manifest Directory
+## 4. Ingress Architecture: IngressController vs. Service Mesh Ingress
+
+To ensure both platform resilience and strict locality routing, the cluster separates **Native Platform Ingress** from **Service Mesh Application Ingress**:
+
+```
+                                    ┌──> [Port 443] OpenShift Router (HostNetwork) ──> Web Console / OAuth
+Client ──> HAProxy :443 (SNI Split) ┤
+                                    └──> [Port 9443 SSL Term] ──> [NodePort 30080] Istio Gateway (Local) ──> App Pods
+```
+
+### A. OpenShift Native IngressController (`openshift-ingress-operator`)
+The default OpenShift router handles platform routes and services:
+- **Configuration**: `spec.endpointPublishingStrategy.type: HostNetwork` with `protocol: PROXY` on ports `80` and `443`.
+- **Replicas**: 4 replicas (`router-default-...`), scheduled 1 per worker node.
+- **Traffic Handled**: OpenShift Web Console (`console-openshift-console.apps...`), OAuth (`oauth-openshift.apps...`), User Workload Monitoring, and Kiali/Grafana consoles.
+- **HAProxy Integration**: HAProxy frontend `:443` passes non-Istio SNI requests directly to worker nodes on port `443` using `send-proxy-v2` in TCP mode.
+
+### B. Istio IngressGateway (`istio-ingressgateway`)
+Dedicated ingress gateway for service mesh applications:
+- **Exposed via NodePort**: Port `80` $\to$ NodePort `30080`, Port `443` $\to$ NodePort `30443`.
+- **`externalTrafficPolicy: Local`**: **Critical setting**. Prevents Kubernetes `kube-proxy` from load balancing NodePort traffic across worker nodes or across metro sites. Incoming packets arriving on `worker0`'s NodePort `30080` are handled *exclusively* by the `istio-ingressgateway` pod running locally on `worker0`.
+- **Placement**: 4 replicas pinned 1 per worker node using `podAntiAffinity` (`kubernetes.io/hostname`).
+
+### C. HAProxy SNI-Based Smart Ingress Routing (`10.10.10.30`)
+HAProxy on LXC 105 performs Layer 4 SNI inspection on incoming port `443` connections:
+- **Istio Application Matches**: SNI matching `shared-edge-route-istio-system.apps...`, `*.mesh.apps...`, or `*.istio.apps...` is routed to local loopback `127.0.0.1:9443`.
+- **SSL Termination Loopback**: Terminates TLS with wildcard certificate `/etc/haproxy/certs/dorneean.pem` and forwards plain HTTP to `istio_http_ingress_traffic_be` (targeting worker NodePorts `30080`).
+- **Platform Ingress Default**: All other SNI requests (Console, OAuth) bypass TLS termination and pass straight to worker nodes on port `443` with PROXY protocol v2.
+
+---
+
+## 5. How to Deploy Workloads Across Both Metro Zones
+
+Follow this 4-step pattern to deploy any application with 50/50 dual-zone distribution, local-zone routing preference, and automated zero-downtime failover.
+
+### Step 1: 50/50 Dual-Zone Pod Distribution (`topologySpreadConstraints`)
+
+Configure `topologySpreadConstraints` in your `Deployment` spec to balance replicas evenly across `topology.istio.io/subzone`:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+  namespace: prod-apps
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: my-app
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      topologySpreadConstraints:
+      # Spread evenly across metro subzones (site-a vs site-b)
+      - maxSkew: 1
+        topologyKey: topology.istio.io/subzone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: my-app
+      # Spread across distinct worker nodes
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: my-app
+      containers:
+      - name: app
+        image: my-registry/my-app:latest
+        ports:
+        - containerPort: 8080
+          name: http
+```
+
+### Step 2: Enable Istio Sidecar Injection
+
+Ensure the namespace has Istio sidecar injection enabled:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: prod-apps
+  labels:
+    istio-injection: enabled
+```
+
+### Step 3: Configure Locality Routing & Outlier Failover (`DestinationRule`)
+
+Create a `DestinationRule` with `localityLbSetting` and `outlierDetection`:
+
+```yaml
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: my-app-locality-failover
+  namespace: prod-apps
+spec:
+  host: my-app-svc.prod-apps.svc.cluster.local
+  trafficPolicy:
+    loadBalancer:
+      localityLbSetting:
+        enabled: true
+        failoverPriority:
+        - "topology.istio.io/subzone"
+    outlierDetection:
+      consecutive5xxErrors: 3
+      interval: 5s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 100
+```
+
+- **`failoverPriority`**: Tells Envoy to assign Priority 0 to pods with the matching `subzone` (`site-a` $\to$ `site-a`), and Priority 1 to the other zone (`site-b`).
+- **`outlierDetection`**: If a pod returns 3 consecutive 5xx errors or fails health checks, Envoy automatically ejects it for 30s and routes traffic to surviving pods in the active/failover zone without dropped connections.
+
+### Step 4: Expose via Shared Gateway (`VirtualService`)
+
+Expose the service through the shared ingress gateway:
+
+```yaml
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: my-app-virtualservice
+  namespace: prod-apps
+spec:
+  hosts:
+  - "my-app.mesh.apps.okd.dorneean.wan"
+  gateways:
+  - istio-system/shared-gateway
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: my-app-svc.prod-apps.svc.cluster.local
+        port:
+          number: 8080
+```
+
+---
+
+## 6. Manifest Directory
 
 All manifests are located in [`openshift-service-mesh/`](file:///Volumes/eXaData/HOME/openshift-service-mesh):
 
@@ -128,13 +278,14 @@ All manifests are located in [`openshift-service-mesh/`](file:///Volumes/eXaData
 - [**`09-istio-observability.yaml`**](./09-istio-observability.yaml): Istio `Telemetry` and Prometheus `PodMonitor` CRs.
 - [**`10-grafana.yaml`**](./10-grafana.yaml): Dedicated Grafana deployment, Prometheus datasources, and OpenShift Route.
 - [**`haproxy-webui/app.py`**](./haproxy-webui/app.py): HAProxy Web Controller daemon running on Proxmox LXC 105.
+- [**`haproxy-webui/haproxy.cfg`**](./haproxy-webui/haproxy.cfg): Full HAProxy production configuration with SNI routing, SSL termination, and sub-second health checks.
 - [**`test-connectivity.sh`**](./test-connectivity.sh): **Non-disruptive continuous health and traffic inspector** (runs indefinitely until Ctrl+C).
 - [**`test-failover.sh`**](./test-failover.sh): Standard software failover test runner (cordoning/draining).
 - [**`hard-test.sh`**](./hard-test.sh): **Hard disaster test runner** simulating simultaneous worker node reboot with high-volume traffic stream validation.
 
 ---
 
-## 5. Testing & Validation Scripts
+## 7. Testing & Validation Suites
 
 ### A. Non-Disruptive Connectivity & Continuous Health Inspector
 Streams live requests indefinitely with real-time response time, pod name, IP address, and site identification. Press `Ctrl+C` at any time to display the summary report.
@@ -166,7 +317,7 @@ Simulates a hard hardware outage by triggering simultaneous reboots on Site A wo
 
 ---
 
-## 6. HAProxy Metro Web Controller (`LXC 105`)
+## 8. HAProxy Metro Web Controller (`LXC 105`)
 
 The HAProxy Web Controller runs as a native systemd daemon (`haproxy-webui.service`) inside **Proxmox LXC 105** (`10.10.10.30`):
 
