@@ -1,0 +1,182 @@
+# OpenShift Metro Stretch Cluster High Availability with Red Hat OpenShift Service Mesh & Dual-Site Ingress
+
+## 1. Executive Summary & Objective
+
+This project delivers an enterprise-grade, active-active high-availability (HA) architecture for a single **Red Hat OpenShift / OKD** cluster stretched across two metro datacenters (**Site A** and **Site B**) with low-latency interconnect ($<10\text{ ms}$ RTT).
+
+```mermaid
+flowchart TD
+    Client["🌐 Client Browser / HTTPS Traffic"]
+    
+    subgraph LB ["External HAProxy Load Balancer (10.10.10.30 - LXC 105)"]
+        HAP_443["HAProxy Frontend :443<br/>SNI Inspection & Routing"]
+        HAP_LOOP["SSL Termination Loopback :9443<br/>Wildcard *.apps.okd.dorneean.wan"]
+        HAP_GUI["Metro Web Controller :9090<br/>Native Stats Admin :9000"]
+    end
+
+    Client -->|"HTTPS :443"| HAP_443
+    HAP_GUI -.->|"UNIX Socket Control"| HAP_443
+
+    HAP_443 -->|"SNI: Istio Routes"| HAP_LOOP
+    HAP_443 -->|"SNI: Console, OAuth, Monitoring<br/>(TCP Mode + PROXY v2)"| W_OCP
+
+    subgraph PlatformIngress ["OpenShift Ingress Routers (:443)"]
+        W_OCP["Worker Nodes Ingress Pods<br/>(OpenShift Console & OAuth)"]
+    end
+
+    subgraph SiteA ["🏢 Site A - Primary Zone (pv1 / site-a)"]
+        W0["worker0 :30080<br/>(externalTrafficPolicy: Local)"]
+        W1["worker1 :30080<br/>(externalTrafficPolicy: Local)"]
+        GW_A["istio-ingressgateway Pods (Site A)"]
+        APP_A["core-application Pods<br/>(10.128.x / 10.129.x)"]
+
+        W0 --> GW_A
+        W1 --> GW_A
+        GW_A -->|"Locality Priority 0"| APP_A
+    end
+
+    subgraph SiteB ["🏢 Site B - Standby Backup Zone (pv1 / site-b)"]
+        W2["worker2 :30080<br/>(externalTrafficPolicy: Local)"]
+        W3["worker3 :30080<br/>(externalTrafficPolicy: Local)"]
+        GW_B["istio-ingressgateway Pods (Site B)"]
+        APP_B["core-application Pods<br/>(10.130.x / 10.131.x)"]
+
+        W2 --> GW_B
+        W3 --> GW_B
+        GW_B -->|"Locality Priority 0"| APP_B
+    end
+
+    HAP_LOOP -->|"Primary HTTP :30080"| W0
+    HAP_LOOP -->|"Primary HTTP :30080"| W1
+    HAP_LOOP -.->|"Backup Standby :30080"| W2
+    HAP_LOOP -.->|"Backup Standby :30080"| W3
+
+    GW_A -.->|"Failover on Outage"| APP_B
+    GW_B -.->|"Failover on Outage"| APP_A
+```
+
+---
+
+### Key Architecture Highlights
+
+1. **Zone A Primary Locality Preference (Active-Passive / Standby Failover)**:
+   - **External HAProxy Load Balancer (LXC 105 `10.10.10.30`)**:
+     - Configured with **Site A as Primary** (`okd4-worker-1`, `okd4-worker-2`) and **Site B as Standby Backup** (`okd4-worker-3`, `okd4-worker-4 backup`).
+     - In normal operation, **100% of ingress traffic preferentially hits Zone A**.
+     - If Zone A experiences node/power failure or is toggled to `MAINT` via the Web Controller, HAProxy **automatically fails over 100% of traffic to Zone B** with zero connection loss.
+2. **SNI-Based Split Ingress & Service Mesh NodePort Routing**:
+   - Inspects SNI on port `443` without breaking standard OpenShift platform traffic.
+   - **OpenShift Native Platform Ingress**: OpenShift Web Console (`console-openshift-console.apps...`), OAuth (`oauth-openshift.apps...`), and monitoring are forwarded as raw TCP with PROXY protocol v2 (`send-proxy-v2`) directly to worker nodes on port `443`.
+   - **Istio Service Mesh Ingress**: Istio canonical routes (`shared-edge-route-istio-system.apps...`, `*.mesh.apps...`, `*.istio.apps...`) are decrypted via local SSL termination loopback (`127.0.0.1:9443`) using `/etc/haproxy/certs/dorneean.pem` and forwarded directly to the `istio-ingressgateway` **NodePort `30080`**.
+3. **Strict Node & Zone Locality (`externalTrafficPolicy: Local`)**:
+   - `istio-ingressgateway` runs 1 pinned replica per worker node across all 4 worker nodes with `externalTrafficPolicy: Local`.
+   - When HAProxy directs traffic to `worker0` / `worker1` (Site A), the packet is processed strictly by the local Istio Ingress Gateway on Site A with zero inter-node or inter-site hops.
+4. **Subzone Locality Load Balancing**:
+   - Workloads are spread 50/50 across `site-a` and `site-b` using `topologySpreadConstraints`.
+   - Istio `DestinationRule` with `localityLbSetting` (`topology.istio.io/subzone`) routes traffic to local pods within the same datacenter.
+5. **Autonomous Zero-Touch Failover & Outlier Detection**:
+   - Automatic cross-metro spillover to the surviving zone if a pod or node experiences consecutive 5xx errors or outages.
+6. **Dedicated Storage Node Isolation**:
+   - Storage nodes `okd4-storage-1..3` are dedicated strictly to Ceph/CSI storage and are excluded from HAProxy ingress load balancing.
+6. **Interactive Management & Full Observability**:
+   - Dedicated **HAProxy Metro Web Controller** for 1-click zone failover simulations.
+   - **Kiali Console** and **Grafana Dashboards** integrated with OpenShift User Workload Monitoring.
+
+---
+
+## 2. Web Consoles & Endpoints
+
+| Service | URL | Authentication | Description |
+| :--- | :--- | :--- | :--- |
+| **OpenShift Web Console** | [https://console-openshift-console.apps.okd.dorneean.wan](https://console-openshift-console.apps.okd.dorneean.wan) | OpenShift OAuth | OpenShift Cluster Administration & Workload Console |
+| **HAProxy Metro Web Controller** | [http://10.10.10.30:9090](http://10.10.10.30:9090) | Open | Interactive Web UI to Enable, Disable (MAINT), Drain Site A & Site B nodes with 1-click controls |
+| **HAProxy Native Stats Admin** | [http://10.10.10.30:9000](http://10.10.10.30:9000) | Open (Admin Mode) | Built-in HAProxy admin tabular interface with server actions |
+| **Kiali Service Mesh Console** | [https://kiali-istio-system.apps.okd.dorneean.wan](https://kiali-istio-system.apps.okd.dorneean.wan) | OpenShift OAuth | Service mesh visual topology, live traffic animation, mTLS status |
+| **Grafana Monitoring** | [https://grafana-istio-system.apps.okd.dorneean.wan](https://grafana-istio-system.apps.okd.dorneean.wan) | Anonymous / OpenShift | Istio performance metrics, RPS, latency & error dashboards |
+| **Application Ingress Route** | [https://shared-edge-route-istio-system.apps.okd.dorneean.wan](https://shared-edge-route-istio-system.apps.okd.dorneean.wan) | Open | Service Mesh application route (NodePort :30080 via HAProxy) |
+
+---
+
+## 3. Node & Topology Mapping
+
+| Node | Proxmox Zone | Subzone (`topology.istio.io/subzone`) | Ingress Ports | Pod CIDR Range | Metro Role |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`master0`** | `pv1` | - | `:6443`, `:22623` | `10.128.0.0/23` | Control Plane (etcd + API) |
+| **`master1`** | `pv1` | - | `:6443`, `:22623` | `10.129.0.0/23` | Control Plane (etcd + API) |
+| **`master2`** | `pv1` | - | `:6443`, `:22623` | `10.130.0.0/23` | Control Plane (etcd + API) |
+| **`worker0`** | `pv1` | **`site-a`** | `:80`, `:443`, `:30080` | `10.128.2.0/23` | **Site A Primary Worker** |
+| **`worker1`** | `pv1` | **`site-a`** | `:80`, `:443`, `:30080` | `10.129.2.0/23` | **Site A Primary Worker** |
+| **`worker2`** | `pv1` | **`site-b`** | `:80`, `:443`, `:30080` | `10.130.2.0/23` | **Site B Standby / Survivor** |
+| **`worker3`** | `pv1` | **`site-b`** | `:80`, `:443`, `:30080` | `10.131.0.0/23` | **Site B Standby / Survivor** |
+
+*(Note: Storage nodes `okd4-storage-1..3` are dedicated to Ceph/CSI storage and are excluded from HTTP/HTTPS ingress balancing).*
+
+---
+
+## 4. Manifest Directory
+
+All manifests are located in [`openshift-service-mesh/`](file:///Volumes/eXaData/HOME/openshift-service-mesh):
+
+- [**`01-servicemesh-subscription.yaml`**](./01-servicemesh-subscription.yaml): Red Hat OpenShift Service Mesh 3.x Operator.
+- [**`02-istio-cni.yaml`**](./02-istio-cni.yaml): `IstioCNI` DaemonSet across all nodes.
+- [**`03-istio-controlplane.yaml`**](./03-istio-controlplane.yaml): `istiod` Control Plane (`meshID: metro-mesh`).
+- [**`04-istio-ingressgateway.yaml`**](./04-istio-ingressgateway.yaml): Ingress Gateway Service (`type: NodePort`, `30080`/`30443`, `externalTrafficPolicy: Local`) and 4-replica Deployment with `podAntiAffinity`.
+- [**`05-sample-metro-app.yaml`**](./05-sample-metro-app.yaml): Workload deployment with metadata reflection, `VirtualService`, and Subzone Locality `DestinationRule`.
+- [**`06-kiali-operator.yaml`**](./06-kiali-operator.yaml): Red Hat OpenShift Service Mesh Kiali Operator subscription.
+- [**`07-kiali-cr.yaml`**](./07-kiali-cr.yaml): Kiali instance with OpenShift OAuth & Grafana integration.
+- [**`08-enable-user-workload-monitoring.yaml`**](./08-enable-user-workload-monitoring.yaml): OpenShift cluster monitoring config for user workload scraping.
+- [**`09-istio-observability.yaml`**](./09-istio-observability.yaml): Istio `Telemetry` and Prometheus `PodMonitor` CRs.
+- [**`10-grafana.yaml`**](./10-grafana.yaml): Dedicated Grafana deployment, Prometheus datasources, and OpenShift Route.
+- [**`haproxy-webui/app.py`**](./haproxy-webui/app.py): HAProxy Web Controller daemon running on Proxmox LXC 105.
+- [**`test-connectivity.sh`**](./test-connectivity.sh): **Non-disruptive continuous health and traffic inspector** (runs indefinitely until Ctrl+C).
+- [**`test-failover.sh`**](./test-failover.sh): Standard software failover test runner (cordoning/draining).
+- [**`hard-test.sh`**](./hard-test.sh): **Hard disaster test runner** simulating simultaneous worker node reboot with high-volume traffic stream validation.
+
+---
+
+## 5. Testing & Validation Scripts
+
+### A. Non-Disruptive Connectivity & Continuous Health Inspector
+Streams live requests indefinitely with real-time response time, pod name, IP address, and site identification. Press `Ctrl+C` at any time to display the summary report.
+
+```bash
+# Continuous real-time probing (runs indefinitely until Ctrl+C)
+./openshift-service-mesh/test-connectivity.sh
+
+# Run with custom polling interval (e.g. 0.05s)
+./openshift-service-mesh/test-connectivity.sh 0.05
+
+# Run a fixed number of probes (e.g. 50 probes)
+./openshift-service-mesh/test-connectivity.sh 50 0.05
+```
+
+### B. Standard Failover Simulation (Pod / Node Cordoning)
+Simulates a Site A outage by cordoning `worker0`/`worker1` and deleting Site A pods, validating 100% absorption by Site B, followed by automated recovery.
+
+```bash
+./openshift-service-mesh/test-failover.sh
+```
+
+### C. Hard Disaster Simulation (Reboot Site A Workers & High-Volume Traffic Test)
+Simulates a hard hardware outage by triggering simultaneous reboots on Site A worker nodes (`worker0` & `worker1`), while streaming 200+ continuous traffic probes through surviving Site B nodes.
+
+```bash
+./openshift-service-mesh/hard-test.sh
+```
+
+---
+
+## 6. HAProxy Metro Web Controller (`LXC 105`)
+
+The HAProxy Web Controller runs as a native systemd daemon (`haproxy-webui.service`) inside **Proxmox LXC 105** (`10.10.10.30`):
+
+### Features
+- **1-Click Zone Actions**:
+  - 🔴 **"Disable Site A (Force Site B)"**: Disables `okd4-worker-1` and `okd4-worker-2` across HTTP, HTTPS, and Istio NodePort backends.
+  - 🟡 **"Disable Site B"**: Disables `okd4-worker-3` and `okd4-worker-4`.
+  - 🟢 **"Restore All Nodes (Active-Active)"**: Restores all 4 worker nodes to `READY`.
+- **Per-Node Controls**: Toggle individual node states between `Ready`, `Disable (Maint)`, and `Drain`.
+- **REST API Endpoints**:
+  - `GET /api/stats`: Real-time session and backend metrics from HAProxy socket.
+  - `POST /api/node/state`: Body: `{"node": "okd4-worker-1", "state": "maint|ready|drain"}`
+  - `POST /api/site/action`: Body: `{"site": "site-a|site-b|all", "action": "maint|ready"}`

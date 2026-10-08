@@ -1,0 +1,27 @@
+apiVersion: kiali.io/v1alpha1
+kind: Kiali
+metadata:
+  name: kiali
+  namespace: istio-system
+spec:
+  deployment:
+    accessible_namespaces:
+    - "**"
+    node_selector:
+      topology.istio.io/subzone: site-b
+  auth:
+    strategy: openshift
+  external_services:
+    istio:
+      root_namespace: istio-system
+    prometheus:
+      url: https://thanos-querier.openshift-monitoring.svc:9091
+      auth:
+        type: bearer
+        use_kiali_token: true
+    grafana:
+      enabled: true
+      in_cluster_url: http://grafana.istio-system.svc:3000
+      url: https://grafana-istio-system.apps.okd.dorneean.wan
+      auth:
+        type: anonymous

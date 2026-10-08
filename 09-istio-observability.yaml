@@ -1,0 +1,38 @@
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: default-mesh-telemetry
+  namespace: istio-system
+spec:
+  accessLogging:
+  - providers:
+    - name: envoy
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: istio-proxies-monitor
+  namespace: istio-system
+spec:
+  selector:
+    matchExpressions:
+    - key: app
+      operator: Exists
+  podMetricsEndpoints:
+  - port: http-envoy-prom
+    path: /stats/prometheus
+    interval: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: prod-apps-proxy-monitor
+  namespace: prod-apps
+spec:
+  selector:
+    matchLabels:
+      app: core-app
+  podMetricsEndpoints:
+  - port: http-envoy-prom
+    path: /stats/prometheus
+    interval: 10s
