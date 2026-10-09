@@ -30,8 +30,9 @@ metadata:
   namespace: prod-apps
 spec:
   selector:
-    matchLabels:
-      app: core-app
+    matchExpressions:
+    - key: app
+      operator: Exists
   podMetricsEndpoints:
   - port: http-envoy-prom
     path: /stats/prometheus

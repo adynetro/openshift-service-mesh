@@ -50,6 +50,7 @@ run_traffic_test() {
   local failed=0
   local site_a=0
   local site_b=0
+  local matched=0
   local total_time_ms=0
 
   for ((i=1; i<=count; i++)); do
@@ -59,9 +60,15 @@ run_traffic_test() {
     local latency=$((end_ts - start_ts))
     total_time_ms=$((total_time_ms + latency))
 
-    local POD_NAME=$(echo "$RESP" | grep "Hostname:" | awk '{print $2}')
+    local FE_POD=$(echo "$RESP" | grep "^Hostname:" | head -n 1 | awk '{print $2}')
+    local FE_NODE=$(echo "$RESP" | grep "^Node:" | head -n 1 | awk '{print $2}')
+    local FE_ZONE=$(echo "$RESP" | grep "^Subzone:" | head -n 1 | awk '{print $2}')
 
-    if [[ -z "$POD_NAME" ]]; then
+    local BE_POD=$(echo "$RESP" | grep "^Backend-Hostname:" | head -n 1 | awk '{print $2}')
+    local BE_NODE=$(echo "$RESP" | grep "^Backend-Node:" | head -n 1 | awk '{print $2}')
+    local BE_ZONE=$(echo "$RESP" | grep "^Backend-Subzone:" | head -n 1 | awk '{print $2}')
+
+    if [[ -z "$FE_POD" ]]; then
       ((failed++))
       echo -e "[REQ #$(printf "%03d" $i)] \033[1;31m[ERROR: CONNECTION DROPPED]\033[0m (${latency}ms)"
       sleep "$delay"
@@ -69,19 +76,25 @@ run_traffic_test() {
     fi
 
     ((success++))
-    local IP_ADDR=$(echo "$RESP" | grep -E "IP: 10\." | head -n 1 | awk '{print $2}')
 
-    if [[ "$IP_ADDR" =~ ^10\.128 || "$IP_ADDR" =~ ^10\.129 ]]; then
+    if [[ "$FE_ZONE" == "site-a" ]]; then
       ((site_a++))
       local COLOR_TAG="\033[1;32m[SITE-A (Primary)]\033[0m"
-    elif [[ "$IP_ADDR" =~ ^10\.130 || "$IP_ADDR" =~ ^10\.131 ]]; then
+    elif [[ "$FE_ZONE" == "site-b" ]]; then
       ((site_b++))
       local COLOR_TAG="\033[1;33m[SITE-B (Survivor)]\033[0m"
     else
       local COLOR_TAG="\033[1;36m[UNKNOWN SITE]\033[0m"
     fi
 
-    echo -e "[REQ #$(printf "%03d" $i)] --> ${COLOR_TAG} Pod: ${POD_NAME} | IP: ${IP_ADDR} (${latency}ms)"
+    if [[ "$FE_ZONE" == "$BE_ZONE" && -n "$BE_ZONE" ]]; then
+      ((matched++))
+      local MATCH_STR="\033[1;32m[SAME-ZONE: ${FE_ZONE}➔${BE_ZONE}]\033[0m"
+    else
+      local MATCH_STR="\033[1;31m[CROSS-ZONE: ${FE_ZONE}➔${BE_ZONE}]\033[0m"
+    fi
+
+    echo -e "[REQ #$(printf "%03d" $i)] --> ${COLOR_TAG} FE: ${FE_NODE} (${FE_POD:0:18}...) ➔ BE: ${BE_NODE} (${BE_POD:0:18}...) ${MATCH_STR} (${latency}ms)"
     sleep "$delay"
   done
 
@@ -92,9 +105,11 @@ run_traffic_test() {
 
   local pct_a=0
   local pct_b=0
+  local pct_match=0
   if (( success > 0 )); then
     pct_a=$(( site_a * 100 / success ))
     pct_b=$(( site_b * 100 / success ))
+    pct_match=$(( matched * 100 / success ))
   fi
 
   echo "-----------------------------------------------------------------------------------"
@@ -102,6 +117,7 @@ run_traffic_test() {
   echo "    Total Requests : ${count} | Succeeded: ${success} ($(( success * 100 / count ))%) | Dropped: ${failed}"
   echo "    Site-A Served  : ${site_a} (${pct_a}%)"
   echo "    Site-B Served  : ${site_b} (${pct_b}%)"
+  echo "    Same-Zone Mesh : ${matched}/${success} (${pct_match}%)"
   echo "    Average Latency: ${avg_lat}ms"
   echo "-----------------------------------------------------------------------------------"
 }
@@ -146,6 +162,7 @@ done
 
 echo " Waiting for application pods to balance across restored Site A nodes..."
 oc rollout status deployment core-application -n prod-apps --timeout=120s >/dev/null 2>&1 || true
+oc rollout status deployment backend-application -n prod-apps --timeout=120s >/dev/null 2>&1 || true
 sleep 5
 
 # ==================================================================================

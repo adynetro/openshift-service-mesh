@@ -28,22 +28,26 @@ flowchart TD
         W0["worker0 :30080<br/>(externalTrafficPolicy: Local)"]
         W1["worker1 :30080<br/>(externalTrafficPolicy: Local)"]
         GW_A["istio-ingressgateway Pods (Site A)"]
-        APP_A["core-application Pods<br/>(10.128.x / 10.129.x)"]
+        FE_A["Tier 1: core-application Pods (Frontend)<br/>(10.128.x / 10.129.x)"]
+        BE_A["Tier 2: backend-application Pods (Backend)<br/>(10.128.x / 10.129.x)"]
 
         W0 --> GW_A
         W1 --> GW_A
-        GW_A -->|"Locality Priority 0"| APP_A
+        GW_A -->|"Locality Priority 0"| FE_A
+        FE_A -->|"Pod-to-Pod Locality Priority 0"| BE_A
     end
 
     subgraph SiteB ["🏢 Site B - Standby Backup Zone (pv1 / site-b)"]
         W2["worker2 :30080<br/>(externalTrafficPolicy: Local)"]
         W3["worker3 :30080<br/>(externalTrafficPolicy: Local)"]
         GW_B["istio-ingressgateway Pods (Site B)"]
-        APP_B["core-application Pods<br/>(10.130.x / 10.131.x)"]
+        FE_B["Tier 1: core-application Pods (Frontend)<br/>(10.130.x / 10.131.x)"]
+        BE_B["Tier 2: backend-application Pods (Backend)<br/>(10.130.x / 10.131.x)"]
 
         W2 --> GW_B
         W3 --> GW_B
-        GW_B -->|"Locality Priority 0"| APP_B
+        GW_B -->|"Locality Priority 0"| FE_B
+        FE_B -->|"Pod-to-Pod Locality Priority 0"| BE_B
     end
 
     HAP_LOOP -->|"Primary HTTP :30080"| W0
@@ -51,34 +55,39 @@ flowchart TD
     HAP_LOOP -.->|"Backup Standby :30080"| W2
     HAP_LOOP -.->|"Backup Standby :30080"| W3
 
-    GW_A -.->|"Failover on Outage"| APP_B
-    GW_B -.->|"Failover on Outage"| APP_A
+    FE_A -.->|"Failover on Outage"| BE_B
+    FE_B -.->|"Failover on Outage"| BE_A
+    GW_A -.->|"Failover on Outage"| FE_B
+    GW_B -.->|"Failover on Outage"| FE_A
 ```
 
 ---
 
 ### Key Architecture Highlights
 
-1. **Zone A Primary Locality Preference (Active-Passive / Standby Failover)**:
+1. **2-Tier Intra-Zone Pod-to-Pod Communication**:
+   - **Tier 1 (Frontend `core-application`)**: Receives ingress requests from `istio-ingressgateway` in its local zone, extracts incoming tracing headers, and calls the backend service.
+   - **Tier 2 (Backend `backend-application`)**: Receives internal mesh calls from the frontend, verifies intra-zone routing (`site-a` $\to$ `site-a`, `site-b` $\to$ `site-b`), and returns responder pod/node identity with sub-millisecond local latency.
+2. **Zone A Primary Locality Preference (Active-Passive / Standby Failover)**:
    - **External HAProxy Load Balancer (LXC 105 `10.10.10.30`)**:
      - Configured with **Site A as Primary** (`okd4-worker-1`, `okd4-worker-2`) and **Site B as Standby Backup** (`okd4-worker-3`, `okd4-worker-4 backup`).
      - In normal operation, **100% of ingress traffic preferentially hits Zone A**.
      - If Zone A experiences node/power failure or is toggled to `MAINT` via the Web Controller, HAProxy **automatically fails over 100% of traffic to Zone B** with zero connection loss.
-2. **SNI-Based Split Ingress & Service Mesh NodePort Routing**:
+3. **SNI-Based Split Ingress & Service Mesh NodePort Routing**:
    - Inspects SNI on port `443` without breaking standard OpenShift platform traffic.
    - **OpenShift Native Platform Ingress**: OpenShift Web Console (`console-openshift-console.apps...`), OAuth (`oauth-openshift.apps...`), and monitoring are forwarded as raw TCP with PROXY protocol v2 (`send-proxy-v2`) directly to worker nodes on port `443`.
    - **Istio Service Mesh Ingress**: Istio canonical routes (`shared-edge-route-istio-system.apps...`, `*.mesh.apps...`, `*.istio.apps...`) are decrypted via local SSL termination loopback (`127.0.0.1:9443`) using `/etc/haproxy/certs/dorneean.pem` and forwarded directly to the `istio-ingressgateway` **NodePort `30080`**.
-3. **Strict Node & Zone Locality (`externalTrafficPolicy: Local`)**:
+4. **Strict Node & Zone Locality (`externalTrafficPolicy: Local`)**:
    - `istio-ingressgateway` runs 1 pinned replica per worker node across all 4 worker nodes with `externalTrafficPolicy: Local`.
    - When HAProxy directs traffic to `worker0` / `worker1` (Site A), the packet is processed strictly by the local Istio Ingress Gateway on Site A with zero inter-node or inter-site hops.
-4. **Subzone Locality Load Balancing**:
+5. **Subzone Locality Load Balancing**:
    - Workloads are spread 50/50 across `site-a` and `site-b` using `topologySpreadConstraints`.
-   - Istio `DestinationRule` with `localityLbSetting` (`topology.istio.io/subzone`) routes traffic to local pods within the same datacenter.
-5. **Autonomous Zero-Touch Failover & Outlier Detection**:
+   - Istio `DestinationRule` with `localityLbSetting` (`topology.istio.io/subzone`) routes traffic to local pods within the same datacenter at both Ingress $\to$ Frontend and Frontend $\to$ Backend levels.
+6. **Autonomous Zero-Touch Failover & Outlier Detection**:
    - Automatic cross-metro spillover to the surviving zone if a pod or node experiences consecutive 5xx errors or outages.
-6. **Dedicated Storage Node Isolation**:
+7. **Dedicated Storage Node Isolation**:
    - Storage nodes `okd4-storage-1..3` are dedicated strictly to Ceph/CSI storage and are excluded from HAProxy ingress load balancing.
-7. **Interactive Management & Full Observability**:
+8. **Interactive Management & Full Observability**:
    - Dedicated **HAProxy Metro Web Controller** for 1-click zone failover simulations.
    - **Kiali Console** and **Grafana Dashboards** integrated with OpenShift User Workload Monitoring.
 
@@ -271,7 +280,7 @@ All manifests are located in [`openshift-service-mesh/`](file:///Volumes/eXaData
 - [**`02-istio-cni.yaml`**](./02-istio-cni.yaml): `IstioCNI` DaemonSet across all nodes.
 - [**`03-istio-controlplane.yaml`**](./03-istio-controlplane.yaml): `istiod` Control Plane (`meshID: metro-mesh`).
 - [**`04-istio-ingressgateway.yaml`**](./04-istio-ingressgateway.yaml): Ingress Gateway Service (`type: NodePort`, `30080`/`30443`, `externalTrafficPolicy: Local`) and 4-replica Deployment with `podAntiAffinity`.
-- [**`05-sample-metro-app.yaml`**](./05-sample-metro-app.yaml): Workload deployment with metadata reflection, `VirtualService`, and Subzone Locality `DestinationRule`.
+- [**`05-sample-metro-app.yaml`**](./05-sample-metro-app.yaml): 2-Tier Workload deployment (`core-application` frontend & `backend-application` backend) with metadata reflection, HTTP tracing propagation, `VirtualService`, and Subzone Locality `DestinationRules` for intra-zone pod-to-pod mesh routing.
 - [**`06-kiali-operator.yaml`**](./06-kiali-operator.yaml): Red Hat OpenShift Service Mesh Kiali Operator subscription.
 - [**`07-kiali-cr.yaml`**](./07-kiali-cr.yaml): Kiali instance with OpenShift OAuth & Grafana integration.
 - [**`08-enable-user-workload-monitoring.yaml`**](./08-enable-user-workload-monitoring.yaml): OpenShift cluster monitoring config for user workload scraping.
