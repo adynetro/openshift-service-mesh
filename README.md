@@ -246,7 +246,7 @@ spec:
 
 ### Step 4: Expose via Shared Gateway (`VirtualService`)
 
-Expose the service through the shared ingress gateway:
+Expose the frontend service through the shared ingress gateway:
 
 ```yaml
 apiVersion: networking.istio.io/v1
@@ -268,6 +268,39 @@ spec:
         host: my-app-svc.prod-apps.svc.cluster.local
         port:
           number: 8080
+```
+
+### Step 5: 2-Tier Pod-to-Pod Locality Pattern (Frontend ➔ Backend)
+
+To test and enforce strict intra-zone communication between dependent microservices:
+
+1. Deploy the **Backend Workload** (`backend-application`) with its own `Service` (`backend-app-svc`) and `DestinationRule` (`backend-app-locality-failover`) containing `localityLbSetting` with `failoverPriority: ["topology.istio.io/subzone"]`.
+2. Configure the **Frontend Workload** to call `http://backend-app-svc.prod-apps.svc.cluster.local:8080/` and propagate distributed tracing headers:
+   - `x-request-id`, `x-b3-traceid`, `x-b3-spanid`, `x-b3-parentspanid`, `x-b3-sampled`, `x-b3-flags`, `x-ot-span-context`, `traceparent`, `tracestate`, `baggage`.
+3. The Envoy sidecar on the Frontend pod evaluates the DestinationRule and automatically forwards the request to a Backend pod in the **exact same subzone** (`site-a` $\to$ `site-a` or `site-b` $\to$ `site-b`).
+4. Sample response displaying both tiers and locality verification:
+
+```text
+================================================================================
+   🌐 2-TIER INTRA-ZONE POD-TO-POD SERVICE MESH COMMUNICATION REPORT
+================================================================================
+[TIER 1: FRONTEND CALLER (Ingress Routed)]
+  • Pod Name    : core-application-7cb89bc87f-jhkw2
+  • Worker Node : worker0
+  • Subzone     : site-a (Primary Site A)
+  • Pod IP      : 10.128.2.18
+
+[TIER 2: BACKEND RESPONDER (Mesh Routed via Locality LB)]
+  • Pod Name    : backend-application-7445675c69-cmgzw
+  • Worker Node : worker1
+  • Subzone     : site-a (Primary Site A)
+  • Pod IP      : 10.129.2.20
+  • Internal RTT: 5.58 ms
+
+[POD-TO-POD ZONE LOCALITY VERIFICATION]
+  • Status      : ✅ SAME-ZONE INTRA-METRO ROUTING (site-a ➔ site-a)
+  • Locality LB : Priority 0 (Local Zone Traffic Preferred - Zero Inter-DC Cross Traffic)
+================================================================================
 ```
 
 ---
